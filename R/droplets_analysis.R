@@ -411,13 +411,18 @@ plot_collection_1 <- function(df,
                               filename = "collection_1.png",
                               title    = "",
                               subtitle = "",
+                              palette  = NULL,
                               dpi      = 300) {
+  
   n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
+  
+  filler <- if (is.null(palette)) nested_fill(df)
+            else ggplot2::scale_fill_manual(values = palette)
 
   p_hist <- ggplot(df %>% dplyr::filter(diameter_um < 150),
                    aes(diameter_um, fill = tag)) +
     geom_histogram(bins = 250) +
-    nested_fill(df) +
+    filler + 
     scale_y_continuous(n.breaks = 5) +
     scale_x_continuous(limits = c(0, 200), expand = c(0, 0)) +
     labs(x = "Droplet diameter, μm",
@@ -440,7 +445,7 @@ plot_collection_1 <- function(df,
     geom_text(aes(label = comma(rcv * 100, accuracy = .01)),
               hjust = 1.5, size = 4, angle = 90,
               color = "white", family = "bold") +
-    nested_fill(df) +
+    filler + 
     scale_y_continuous(n.breaks = 10) +
     scale_x_discrete(labels = rep_labels()) +
     labs(y = "Coefficient of variation, %",
@@ -472,6 +477,7 @@ plot_collection_2 <- function(df,
                               filename = "collection_2.png",
                               title    = "",
                               subtitle = "",
+                              palette  = NULL,
                               dpi      = 300) {
 
   # ---- Pre-compute per-replicate summaries ----------------------------------
@@ -489,7 +495,8 @@ plot_collection_2 <- function(df,
     )
 
   n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
-  filler  <- nested_fill(df)
+  filler <- if (is.null(palette)) nested_fill(df)
+            else ggplot2::scale_fill_manual(values = palette)
   x_lab   <- rep_labels()
 
   # ---- Panel A: diameter ----------------------------------------------------
@@ -566,19 +573,28 @@ plot_collection_3 <- function(df,
                               filename = "plot_collection_3.png",
                               title     = "",
                               subtitle  = "",
-                              dpi       = 300) {
+                              palette   = NULL, 
+                              dpi       = 300,
+                              n_repeat = 25,
+                              sample_size = 5000) {
 
   # ---- Initial helpers & constants -----------------------------------------
   n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
-  filler  <- nested_fill(df)
+  
+  colourer <- if (is.null(palette)) nested_colour(df)
+              else ggplot2::scale_colour_manual(values = palette)
+  
+  filler <- if (is.null(palette)) nested_fill(df)
+            else ggplot2::scale_fill_manual(values = palette)
+
   x_lab   <- rep_labels()
   screen_once <- function(df, lhs, rhs) {
     # (inner boot-strapped robust ANOVA; unchanged logic)
     df[[rhs]] <- factor(df[[rhs]])
     idx_by_lvl <- split(seq_len(nrow(df)), df[[rhs]])
-    purrr::map_dfr(seq_len(25), function(i) {
+    purrr::map_dfr(seq_len(n_repeat), function(i) {
       idx <- unlist(lapply(idx_by_lvl,
-                           sample, size = 5000, replace = TRUE),
+                           sample, size = sample_size, replace = TRUE),
                     use.names = FALSE)
       smp <- df[idx, , drop = FALSE]
       tst <- WRS2::t1waybt(
@@ -629,7 +645,8 @@ plot_collection_3 <- function(df,
       dplyr::rename_with(~ ifelse(.x == "group", "grp", .x)) %>%
       dplyr::rename_with(~ sub("^([0-9])", "p_\\1", .x)) %>%
       dplyr::summarise(
-        n_repeats    = sum(!is.na(effect_size)),
+        n_repeats    = n_repeat,
+        sample_size  = sample_size,
         med_effsize  = median(effect_size,   na.rm = TRUE),
         iqr_effsize  = IQR(effect_size,      na.rm = TRUE),
         med_varexpl  = median(var_explained, na.rm = TRUE),
@@ -672,23 +689,23 @@ plot_collection_3 <- function(df,
   p_qq <- ggplot(qq_df, aes(sample = z_diam, colour = group)) +
     stat_qq(size = .8, alpha = .6, show.legend = FALSE) +
     stat_qq_line(show.legend = FALSE) +
-    scale_color_npg() +
+    colourer + 
     facet_wrap(~group, scales = "free") +
     labs(title = "Q‒Q plots",
          x     = "Theoretical N(0,1)",
          y     = "Standardised sample",
-         color = glue::glue("Groups"))
+         color = "Groups")
 
   # ---- 4. Box-plot ----------------------------------------------------------
   p_box <- ggplot(df, aes(group, diameter_um, fill = group)) +
     geom_boxplot(outlier.shape = NA) +
-    scale_fill_npg() +
+    filler + 
     coord_cartesian(ylim = quantile(df$diameter_um, c(.05, .95))) +
     stat_summary(fun = mean, geom = "point", colour = "#ffffff",
                  shape = 8, size = 3, show.legend = FALSE) +
     labs(y = "Droplet diameter, μm (5% – 95% quantile)",
          x = "Parameter setting",
-         fill = glue::glue("Groups"),
+         fill = "Groups",
          caption = "* stands for diameter mean, per group")
 
   # ---- 5. Assemble & write PNG ---------------------------------------------
@@ -799,21 +816,32 @@ process_runs <- function(root,
     
     tag <- gsub("[^A-Za-z0-9]", "", expr)   # safe filename fragment
     
+    
     if (!isTRUE(skip_plots)) {
+      
+      pal_tag <- environment(environment(nested_fill(df_tagged)$palette)$palette)$values
+      
+      pal_group <- vapply(unique(df_tagged$group), function(g) {
+        pal_tag[match(TRUE, startsWith(names(pal_tag), paste0(g, ":")))]
+      }, character(1))
+      
       plot_collection_1(
         df    = df_tagged,
+        palette = pal_tag,
         filename = file.path(out_dir,
                              sprintf("%s_%s_c1.png", stamp, tag)),
         dpi      = dpi
       )
       plot_collection_2(
         df    = df_tagged,
+        palette = pal_tag,
         filename = file.path(out_dir,
                              sprintf("%s_%s_c2.png", stamp, tag)),
         dpi      = dpi
       )
       plot_collection_3(
         df    = df_tagged,
+        palette = pal_group,
         filename = c(file.path(out_dir,
                              sprintf("%s_%s_c3.png", stamp, tag)),
                      file.path(out_dir,
