@@ -58,7 +58,7 @@ process_runs(
 
 ```
 
-For more detailed customization see source code.
+For more detailed customization see source code. Test with dummy data frame can be found in `spec` directory.
 
 ## License
 
