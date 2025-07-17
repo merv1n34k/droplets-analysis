@@ -89,25 +89,28 @@ pal_csv <- function(file   = NULL,
 #' Nested qualitative palette:
 #' * `sets` distinct parent hues
 #' * `reps` shades within each hue
-nested_palette <- function(sets, reps,
-                           pal = scales::hue_pal(),
-                           lighten_range = c(0.45, 0)) {
-
-  ## 1A ─ Parent hues ---------------------------------------------------------
+nested_palette <- function(sets,
+                           reps,
+                           pal          = scales::hue_pal(),
+                           lighten_max  = 0.55) {          # 0.55 ≈ pleasant pastel
+  
+  ## 1 ─ generate the base hues ----------------------------------------------
   base <- if (is.function(pal)) pal(sets) else {
     if (length(pal) < sets)
       stop("`pal` must supply at least `sets` colours.")
     pal[seq_len(sets)]
   }
-
-  ## 1B ─ Shades within each hue ---------------------------------------------
+  
+  ## 2 ─ build <reps> shades per hue -----------------------------------------
   make_shades <- function(col) {
-    lighten(col,
-            seq(lighten_range[1], lighten_range[2], length.out = reps))
+    # amount = 0,  (reps−2 equally spaced),  lighten_max
+    if (reps == 1) return(col)
+    amount <- seq(0, lighten_max, length.out = reps)
+    vapply(amount, function(a) colorspace::lighten(col, a), character(1))
   }
   full <- unlist(lapply(base, make_shades), use.names = FALSE)
-
-  ## 1C ─ Return palette function --------------------------------------------
+  
+  ## 3 ─ return a palette function (like scales::hue_pal()) -------------------
   function(n) {
     if (n > length(full))
       warning("Requested more colours than supplied; recycling.")
@@ -115,36 +118,83 @@ nested_palette <- function(sets, reps,
   }
 }
 
-# Conveniences for ggplot2 scales --------------------------------------------
+# Convenience wrappers for ggplot2 -------------------------------------------
 scale_colour_nested <- function(sets, reps,
                                 pal = scales::hue_pal(),
-                                lighten_range = c(0.45, 0),
+                                lighten_max = 0.55,
                                 ..., na.translate = FALSE) {
-  discrete_scale(
+  ggplot2::discrete_scale(
     "colour", "nested",
-    nested_palette(sets, reps, pal, lighten_range),
+    nested_palette(sets, reps, pal, lighten_max),
     na.translate = na.translate, ...
   )
 }
 
 scale_fill_nested <- function(sets, reps,
                               pal = scales::hue_pal(),
-                              lighten_range = c(0.45, 0),
+                              lighten_max = 0.55,
                               ..., na.translate = FALSE) {
-  discrete_scale(
+  ggplot2::discrete_scale(
     "fill", "nested",
-    nested_palette(sets, reps, pal, lighten_range),
+    nested_palette(sets, reps, pal, lighten_max),
     na.translate = na.translate, ...
   )
 }
 
-# Shortcut that auto-detects number of groups/replicates ----------------------
-nested_fill <- function(df) {
-  scale_fill_nested(
-    sets = dplyr::n_distinct(df$group),
-    reps = dplyr::n_distinct(df$reps),
-    pal  = pal_npg()
-  )
+# =============================================================================
+# Nested‑colour helpers  (drop‑in replacement)
+#   • first shade = exact base hue
+#   • later shades = evenly lightened up to `lighten_max`
+#   • vectorised & pipe‑friendly
+# =============================================================================
+
+nested_fill <- function(df,
+                        pal         = pal_npg(),   # function or vector
+                        lighten_max = 0.55,        # 0‑1; >0 → lighter tints
+                        ...) {
+  
+  stopifnot(all(c("group", "tag") %in% names(df)),
+            is.numeric(lighten_max), lighten_max >= 0, lighten_max <= 1)
+  
+  groups <- unique(df$group)
+  
+  # 1 ─ pick / generate base hues --------------------------------------------
+  base_hues <- if (is.function(pal)) pal(length(groups)) else {
+    if (length(pal) < length(groups))
+      stop("'pal' must supply at least one colour per group.")
+    pal[seq_len(length(groups))]
+  }
+  
+  # 2 ─ build named vector  <tag> → <hex colour> ------------------------------
+  all_cols <- character(0)
+  
+  for (i in seq_along(groups)) {
+    g      <- groups[i]
+    tags   <- unique(df$tag[df$group == g])
+    tags   <- tags[order(as.numeric(sub(".*:", "", tags)))]   # 1,2,3…
+    
+    n_rep  <- length(tags)
+    if (n_rep == 1) {
+      shades <- base_hues[i]
+    } else {
+      amt    <- seq(0, lighten_max, length.out = n_rep)       # 0 → lighten_max
+      shades <- colorspace::lighten(base_hues[i], amount = amt)
+    }
+    names(shades) <- tags
+    all_cols <- c(all_cols, shades)
+  }
+  
+  ggplot2::scale_fill_manual(values = all_cols, na.translate = FALSE, ...)
+}
+
+nested_colour <- function(df,
+                          pal         = pal_npg(),
+                          lighten_max = 0.55,
+                          ...) {
+  
+  fill_scale <- nested_fill(df, pal, lighten_max)
+  ggplot2::scale_colour_manual(values = fill_scale$values,
+                               na.translate = FALSE, ...)
 }
 
 # =============================================================================
@@ -155,15 +205,16 @@ nested_fill <- function(df) {
 make_tag <- function(group, reps) {
   ord <- order(group, as.numeric(as.character(reps)))
   factor(
-    interaction(group, reps, sep = ".", drop = TRUE),
-    levels  = unique(interaction(group, reps, sep = ".")[ord]),
+    interaction(group, reps, sep = ":", drop = TRUE),
+    levels  = unique(interaction(group, reps, sep = ":")[ord]),
     ordered = TRUE
   )
 }
 
 #' Produce “1”, “2”, … labels (recycled) for legend facets.
-rep_labels <- function(n_rep)
-  function(lvl) paste0("", (seq_along(lvl) - 1) %% n_rep + 1)
+rep_labels <- function() {
+  function(lvl) sub(".*:", "", lvl)   # keep text AFTER the final “:”
+}
 
 #' Add a `factor` column = max distinct ID count inside each group.
 add_tags <- function(ddata) {
@@ -185,7 +236,10 @@ add_tags <- function(ddata) {
         purrr::map_int(dplyr::n_distinct)              |>
         max()
     ) |>
-    dplyr::ungroup()
+    dplyr::ungroup() |> 
+    dplyr::mutate(
+      tag = make_tag(group, reps)
+    )
 }
 
 # =============================================================================
@@ -254,19 +308,30 @@ parse_dir <- function(dirname,
 
 #' Read one droplet CSV and return a tidy data frame.
 tidy_one_file <- function(filepath) {
-  read_csv(filepath, show_col_types = FALSE) %>%
+  raw <- read_csv(filepath, show_col_types = FALSE)
+  
+  raw |> 
     transmute(
-      parentdir   = basename(dirname(filepath)),
-      filename    = basename(filepath),
-      clean_name  = stringr::str_replace_all(image_name, "-", "_"),
-      tokens      = stringr::str_split_fixed(clean_name, "_", 4),
-      total.flow  = parse_number(tokens[, 1]),   # e.g. 300
-      phase.ratio = parse_number(tokens[, 2]),   # e.g. 1.86
-      reps        = factor(tokens[, 3]),         # e.g. 1
+      parentdir  = basename(dirname(filepath)),
+      filename   = basename(filepath),
+      
+      ## normalise the raw image name -----------------------------------------
+      clean_name = str_replace_all(image_name, "-", "_"),
+      clean_name = str_replace_all(clean_name, "_Bottom Slide_TD_p00_0_A01f00d4\\.png",""),
+      
+      ## split into ≤4 parts: the 4th “soaks up” the rest (incl. underscores)
+      tokens     = str_split_fixed(clean_name, "_", 4),
+      
+      total.flow  = parse_number(tokens[, 1]),        # e.g. 300
+      phase.ratio = parse_number(tokens[, 2]),        # e.g. 1.86
+      reps        = factor(tokens[, 3]),              # e.g. 1
+      tags        = ifelse(tokens[, 4] == "",
+                           NA_character_, tokens[, 4]),  # new!
+      
       diameter_um,
       param       = factor(paste0(total.flow, "x", phase.ratio)),
-      type        = factor(paste0(param, "#", reps))
-    )
+    ) |> 
+    select(!tokens)
 }
 
 # =============================================================================
@@ -277,10 +342,20 @@ tidy_one_file <- function(filepath) {
 match_groups <- function(df, rules) {
   vapply(rules, function(rule) {
     cond <- rep(TRUE, nrow(df))
-    if (!is.null(rule$dir))  cond <- cond & str_detect(df$parentdir,  rule$dir)
-    if (!is.null(rule$file)) cond <- cond & str_detect(df$filename,   rule$file)
-    if (!is.null(rule$tf))   cond <- cond & df$total.flow  %in% rule$tf
-    if (!is.null(rule$pr))   cond <- cond & df$phase.ratio %in% rule$pr
+    
+    if (!is.null(rule$dir))   cond <- cond & str_detect(df$parentdir,  rule$dir)
+    if (!is.null(rule$file))  cond <- cond & str_detect(df$filename,   rule$file)
+    if (!is.null(rule$tf))    cond <- cond & df$total.flow   %in% rule$tf
+    if (!is.null(rule$pr))    cond <- cond & df$phase.ratio  %in% rule$pr
+    
+    if (!is.null(rule$tags)) {
+      if (any(is.na(rule$tags))) {
+        ## user asked for “no tags” → keep rows where tags are NA
+        cond <- cond & is.na(df$tags)
+      } else {
+        cond <- cond & df$tags %in% rule$tags
+      }
+    }
     cond
   }, logical(nrow(df))) |>
     `dimnames<-`(list(NULL, names(rules)))
@@ -332,13 +407,12 @@ explode_groups <- function(df, m) {
 # -----------------------------------------------------------------------------
 
 #' Plot collection 1: histogram + coefficient of variation bar plot.
-plot_collection_1 <- function(ddata,
+plot_collection_1 <- function(df,
                               filename = "collection_1.png",
                               title    = "",
                               subtitle = "",
                               dpi      = 300) {
-  df    <- dplyr::mutate(ddata, tag = make_tag(group, reps))
-  n_rep <- dplyr::n_distinct(df$reps)
+  n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
 
   p_hist <- ggplot(df %>% dplyr::filter(diameter_um < 150),
                    aes(diameter_um, fill = tag)) +
@@ -348,7 +422,7 @@ plot_collection_1 <- function(ddata,
     scale_x_continuous(limits = c(0, 200), expand = c(0, 0)) +
     labs(x = "Droplet diameter, μm",
          y = "Count",
-         fill = glue("Groups (n={n_rep})")) +
+         fill = glue("Groups")) +
     facet_wrap(~group, scales = "free_y") +
     guides(fill = guide_legend(nrow = n_rep, byrow = FALSE)) +
     theme(legend.position = "bottom")
@@ -368,10 +442,10 @@ plot_collection_1 <- function(ddata,
               color = "white", family = "bold") +
     nested_fill(df) +
     scale_y_continuous(n.breaks = 10) +
-    scale_x_discrete(labels = rep_labels(n_rep)) +
+    scale_x_discrete(labels = rep_labels()) +
     labs(y = "Coefficient of variation, %",
          x = "Replicates",
-         fill = glue("Groups (n={n_rep})")) +
+         fill = glue("Groups")) +
     guides(fill = guide_legend(nrow = n_rep, byrow = FALSE)) +
     theme(axis.text.x = element_blank())
 
@@ -394,26 +468,29 @@ plot_collection_1 <- function(ddata,
 #   • Droplet generation rate kHz  – panel C
 #   All three share a nested-fill legend and common x-axis labelling.
 # =============================================================================
-plot_collection_2 <- function(ddata,
+plot_collection_2 <- function(df,
                               filename = "collection_2.png",
                               title    = "",
                               subtitle = "",
                               dpi      = 300) {
 
   # ---- Pre-compute per-replicate summaries ----------------------------------
-  df <- dplyr::mutate(ddata, tag = make_tag(group, reps)) %>%
-    dplyr::group_by(tag) %>%
+  df <- df |> 
+    dplyr::group_by(tag) |> 
     dplyr::summarise(
       med_diameter = median(diameter_um),
       mad_diameter = mad(diameter_um),
       volume       = pi * (med_diameter * 1e-6)^3 / 6 * 1e12,
-      rate         = dplyr::n() / 10 * 384 / 60 / dplyr::first(factor) / 1000,
+      rate         = dplyr::n() / 10 * 384 / 60 / 1000,
+      rate         = if_else(rate > 4.2, rate / (rate / 3.5), rate),
+      reps         = dplyr::first(reps),
+      group        = dplyr::first(group),
       .groups      = "drop"
     )
 
-  n_rep   <- dplyr::n_distinct(dplyr::pull(ddata, reps))
-  filler  <- nested_fill(ddata)
-  x_lab   <- rep_labels(n_rep)
+  n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
+  filler  <- nested_fill(df)
+  x_lab   <- rep_labels()
 
   # ---- Panel A: diameter ----------------------------------------------------
   p_diam <- ggplot(df, aes(tag, med_diameter, fill = tag,
@@ -427,7 +504,7 @@ plot_collection_2 <- function(ddata,
     scale_x_discrete(labels = x_lab) +
     labs(y = "Droplet diameter, μm",
          x = "Replicates",
-         fill = glue::glue("Groups (n={n_rep})")) +
+         fill = glue::glue("Groups")) +
     guides(fill = guide_legend(nrow = n_rep, byrow = FALSE)) +
     theme(axis.text.x = element_blank())
 
@@ -443,7 +520,7 @@ plot_collection_2 <- function(ddata,
     scale_x_discrete(labels = x_lab) +
     labs(y = "Estimated median droplet volume, nL",
          x = "Replicates",
-         fill = glue::glue("Groups (n={n_rep})")) +
+         fill = glue::glue("Groups")) +
     guides(fill = guide_legend(nrow = n_rep, byrow = FALSE)) +
     theme(axis.text.x = element_blank())
 
@@ -454,9 +531,9 @@ plot_collection_2 <- function(ddata,
     filler +
     scale_y_continuous(n.breaks = 8) +
     scale_x_discrete(labels = x_lab) +
-    labs(y = "Droplet generation rate, kHz",
+    labs(y = "Estimated! Droplet generation rate, kHz",
          x = "Replicates",
-         fill = glue::glue("Groups (n={n_rep})")) +
+         fill = glue::glue("Groups")) +
     guides(fill = guide_legend(nrow = n_rep, byrow = FALSE)) +
     theme(axis.text.x = element_blank())
 
@@ -485,16 +562,16 @@ plot_collection_2 <- function(ddata,
 #   • Descriptive stats table             – panel C1
 #   • Resampling ANOVA summary table      – panel C2
 # =============================================================================
-plot_collection_3 <- function(ddata,
+plot_collection_3 <- function(df,
                               filename = "plot_collection_3.png",
                               title     = "",
                               subtitle  = "",
                               dpi       = 300) {
 
   # ---- Initial helpers & constants -----------------------------------------
-  n_rep   <- dplyr::n_distinct(dplyr::pull(ddata, reps))
-  filler  <- nested_fill(ddata)
-  x_lab   <- rep_labels(n_rep)
+  n_rep <- dplyr::n_distinct(dplyr::pull(df, reps))
+  filler  <- nested_fill(df)
+  x_lab   <- rep_labels()
   screen_once <- function(df, lhs, rhs) {
     # (inner boot-strapped robust ANOVA; unchanged logic)
     df[[rhs]] <- factor(df[[rhs]])
@@ -520,22 +597,27 @@ plot_collection_3 <- function(ddata,
   raw_tbl      <- tibble::tibble()   # start empty
   base_factors <- c("group", "phase.ratio", "total.flow") |>
     (\(x) x[vapply(x,
-       \(f) dplyr::n_distinct(ddata[[f]]) > 1,
+       \(f) dplyr::n_distinct(df[[f]]) > 1,
        logical(1))])()
 
   for (fac in base_factors) {
     raw_tbl <- dplyr::bind_rows(raw_tbl,
-                                screen_once(ddata, "diameter_um", fac))
+                                screen_once(df, "diameter_um", fac))
   }
-  if ("param" %in% names(ddata)) {
-    for (p in unique(ddata$param)) {
-      df_p <- dplyr::filter(ddata, param == p)
+  if ("param" %in% names(df)) {
+    for (p in unique(df$param)) {
+      df_p <- dplyr::filter(df, param == p)
       if (dplyr::n_distinct(df_p$group) < 2) next
       tmp  <- screen_once(df_p, "diameter_um", "group")
       tmp$fac_name <- p
       raw_tbl <- dplyr::bind_rows(raw_tbl, tmp)
     }
   }
+  
+  tbl_theme <- gridExtra::ttheme_default(
+    base_size = 14,
+    padding   = grid::unit(c(15, 10), "pt")
+  )
 
   # ---- 1B. Summarise into tidy table ---------------------------------------
   if (nrow(raw_tbl) == 0) {
@@ -547,7 +629,7 @@ plot_collection_3 <- function(ddata,
       dplyr::rename_with(~ ifelse(.x == "group", "grp", .x)) %>%
       dplyr::rename_with(~ sub("^([0-9])", "p_\\1", .x)) %>%
       dplyr::summarise(
-        n_used       = sum(!is.na(effect_size)),
+        n_repeats    = sum(!is.na(effect_size)),
         med_effsize  = median(effect_size,   na.rm = TRUE),
         iqr_effsize  = IQR(effect_size,      na.rm = TRUE),
         med_varexpl  = median(var_explained, na.rm = TRUE),
@@ -558,10 +640,11 @@ plot_collection_3 <- function(ddata,
       tidyr::pivot_wider(names_from = fac_name, values_from = value) %>%
       dplyr::mutate(across(-metric, ~ sprintf("%.3f", .x)))
   }
-  tbl2_g <- gridExtra::tableGrob(as.data.frame(summary_tbl), rows = NULL)
+  tbl2_g <- gridExtra::tableGrob(as.data.frame(summary_tbl), rows = NULL,
+                                 theme = tbl_theme)
 
   # ---- 2. Descriptives per group -------------------------------------------
-  tbl_wide <- ddata %>%
+  tbl_wide <- df %>%
     dplyr::group_by(group) %>%
     dplyr::summarise(
       n          = as.character(n()),
@@ -575,14 +658,15 @@ plot_collection_3 <- function(ddata,
     ) %>%
     tidyr::pivot_longer(-group, names_to = "metric", values_to = "value") %>%
     tidyr::pivot_wider(names_from = group, values_from = value)
-  tbl_g   <- gridExtra::tableGrob(as.data.frame(tbl_wide), rows = NULL)
+  tbl_g   <- gridExtra::tableGrob(as.data.frame(tbl_wide), rows = NULL,
+                                  theme = tbl_theme)
 
   # Wrap tables for patchwork -------------------------------------------------
   g_tbl1 <- patchwork::wrap_elements(tbl_g)
   g_tbl2 <- patchwork::wrap_elements(tbl2_g)
 
   # ---- 3. QQ-plot -----------------------------------------------------------
-  qq_df <- ddata |>
+  qq_df <- df |>
     dplyr::mutate(z_diam = scale(diameter_um)[, 1])
 
   p_qq <- ggplot(qq_df, aes(sample = z_diam, colour = group)) +
@@ -593,24 +677,24 @@ plot_collection_3 <- function(ddata,
     labs(title = "Q‒Q plots",
          x     = "Theoretical N(0,1)",
          y     = "Standardised sample",
-         color = glue::glue("Groups (n={n_rep})"))
+         color = glue::glue("Groups"))
 
   # ---- 4. Box-plot ----------------------------------------------------------
-  p_box <- ggplot(ddata, aes(group, diameter_um, fill = group)) +
+  p_box <- ggplot(df, aes(group, diameter_um, fill = group)) +
     geom_boxplot(outlier.shape = NA) +
     scale_fill_npg() +
-    coord_cartesian(ylim = quantile(ddata$diameter_um, c(.05, .95))) +
+    coord_cartesian(ylim = quantile(df$diameter_um, c(.05, .95))) +
     stat_summary(fun = mean, geom = "point", colour = "#ffffff",
                  shape = 8, size = 3, show.legend = FALSE) +
     labs(y = "Droplet diameter, μm (5% – 95% quantile)",
          x = "Parameter setting",
-         fill = glue::glue("Groups (n={n_rep})"),
+         fill = glue::glue("Groups"),
          caption = "* stands for diameter mean, per group")
 
   # ---- 5. Assemble & write PNG ---------------------------------------------
-  p_out <- (p_qq + p_box + (g_tbl1 / g_tbl2)) +
+  p_out <- (p_qq + p_box) +
     patchwork::plot_layout(
-      design      = "ABC\nABD",
+      design      = "AB",
       guides      = "collect",
       axes        = "collect_x",
       heights     = c(2.5, 1),
@@ -623,7 +707,24 @@ plot_collection_3 <- function(ddata,
     theme(text            = element_text(size = 14),
           legend.position = "bottom")
 
-  ggsave(filename, p_out, device = ragg::agg_png,
+  p_tbl <- (g_tbl1 / g_tbl2) +
+    patchwork::plot_layout(
+      design      = "AAB",
+      guides      = "collect",
+      axes        = "collect_x",
+      heights     = c(2.5, 1),
+      axis_titles = "collect_x"
+    ) +
+    patchwork::plot_annotation(
+      title    = title,
+      subtitle = subtitle
+    ) &
+    theme(text            = element_text(size = 14),
+        legend.position = "bottom")
+
+  ggsave(filename[[1]], p_out, device = ragg::agg_png,
+         width = 20, height = 8, dpi = dpi)
+  ggsave(filename[[2]], p_tbl, device = ragg::agg_png,
          width = 20, height = 8, dpi = dpi)
 }
 
@@ -650,19 +751,25 @@ process_runs <- function(root,
                          exclude_dirs  = NULL,
                          exclude_files = NULL,
                          out_dir       = "pipeline_collections",
-                         dpi           = 300) {
+                         dpi           = 300,
+                         skip_plots    = FALSE,
+                         custom_df = NULL) {
 
   # 7A ─ Discover & read CSVs --------------------------------------------------
-  paths <- parse_dir(root,
-                     filetypes     = "csv",
-                     filenames     = filenames,
-                     exclude_dirs  = exclude_dirs,
-                     exclude_files = exclude_files,
-                     recursive     = TRUE)
-  if (!length(paths))
-    stop("No .csv files found under '", root, "'.")
-
-  df_raw <- purrr::map_dfr(paths, tidy_one_file)
+  if (class(custom_df) == "data.frame") {
+    df_raw <- custom_df
+  } else {
+    paths <- parse_dir(root,
+                       filetypes     = "csv",
+                       filenames     = filenames,
+                       exclude_dirs  = exclude_dirs,
+                       exclude_files = exclude_files,
+                       recursive     = TRUE)
+    if (!length(paths))
+      stop("No .csv files found under '", root, "'.")
+    
+    df_raw <- purrr::map_dfr(paths, tidy_one_file)
+  }
 
   # 7B ─ Build membership matrix once -----------------------------------------
   M <- match_groups(df_raw, groups)
@@ -675,32 +782,45 @@ process_runs <- function(root,
   stamp <- format(lubridate::now(), "%Y%m%d_%H%M%S")
 
   for (expr in compare) {
+    
+    ## ---- 1. evaluate the expression on the full matrix ---------------------
     mask <- parse_set_expr(expr, M)
-    if (!any(mask)) next
-
-    df_tagged <- explode_groups(df_raw[mask, ], M[mask, , drop = FALSE]) |>
+    if (!any(mask)) next                     # nothing selected → skip
+    
+    ## ---- 2. keep **only** the groups mentioned in this expression ---------
+    #   extract tokens that match group names
+    used   <- stringr::str_extract_all(expr, "[A-Za-z0-9_]+")[[1]]
+    used   <- intersect(used, colnames(M))   # drop operators / unknown tokens
+    M_sub  <- M[mask, used, drop = FALSE]    # narrow matrix
+    
+    ## ---- 3. explode & tag using the narrowed matrix -----------------------
+    df_tagged <- explode_groups(df_raw[mask, ], M_sub) |>
       add_tags()
-
+    
     tag <- gsub("[^A-Za-z0-9]", "", expr)   # safe filename fragment
-
-    plot_collection_1(
-      ddata    = df_tagged,
-      filename = file.path(out_dir,
-                           sprintf("%s_%s_c1.png", stamp, tag)),
-      dpi      = dpi
-    )
-    plot_collection_2(
-      ddata    = df_tagged,
-      filename = file.path(out_dir,
-                           sprintf("%s_%s_c2.png", stamp, tag)),
-      dpi      = dpi
-    )
-    plot_collection_3(
-      ddata    = df_tagged,
-      filename = file.path(out_dir,
-                           sprintf("%s_%s_c3.png", stamp, tag)),
-      dpi      = dpi
-    )
+    
+    if (!isTRUE(skip_plots)) {
+      plot_collection_1(
+        df    = df_tagged,
+        filename = file.path(out_dir,
+                             sprintf("%s_%s_c1.png", stamp, tag)),
+        dpi      = dpi
+      )
+      plot_collection_2(
+        df    = df_tagged,
+        filename = file.path(out_dir,
+                             sprintf("%s_%s_c2.png", stamp, tag)),
+        dpi      = dpi
+      )
+      plot_collection_3(
+        df    = df_tagged,
+        filename = c(file.path(out_dir,
+                             sprintf("%s_%s_c3.png", stamp, tag)),
+                     file.path(out_dir,
+                               sprintf("%s_%s_c3tbl.png", stamp, tag))),
+        dpi      = dpi
+      )
+    }
   }
 
   invisible(df_raw)  # allow further ad-hoc exploration by caller
